@@ -31,6 +31,7 @@ except Exception:
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter
 from telethon import TelegramClient, events
+from telethon.errors import FloodWaitError
 from telethon.tl import functions
 from telethon.tl.types import DocumentAttributeSticker, DocumentAttributeVideo, InputStickerSetEmpty
 
@@ -43,8 +44,7 @@ TERMINAL_PREFIX = "$"
 QUOTE_DIR = Path("downloads/quotes")
 MEDIA_DIR = Path("downloads/media")
 DOWNLOAD_DIR = Path("downloads/links")
-MAX_SPAM_COUNT = 1000
-SPAM_DELAY_SECONDS = 0.05
+SPAM_DELAY_SECONDS = 0
 ONLINE_REFRESH_SECONDS = max(10, int(os.environ.get("TOPUSER_ONLINE_REFRESH_SECONDS", "10")))
 CREDIT_TEXT = "TopUser by trwste"
 CREDIT_HTML = '<i>TopUser by <a href="https://t.me/trwste">trwste</a></i>'
@@ -129,6 +129,8 @@ AVATAR_CACHE = {}
 ACTIVE_SPAMS = {}
 ACTIVE_EXPORTS = {}
 EXPORT_AVATAR_CACHE = {}
+ACTIVE_COPIES = {}
+COPY_TASKS = set()
 
 try:
     BRASILIA_TZ = ZoneInfo("America/Sao_Paulo") if ZoneInfo else timezone(timedelta(hours=-3))
@@ -179,7 +181,7 @@ Quotes
   .q on selected quote  quote only selected Telegram quote text
 
 Spam
-  .spam text N          send text N times, max 1000
+  .spam text N          send text N times
   .spam N               reply to media and resend it N times
   .unspam               stop spam in this chat/topic
 
@@ -202,6 +204,10 @@ Chat
   .exportchat ID/@user  export another chat as HTML
   .cancelexport         stop export and send partial HTML
   .cl                   delete your messages in this chat/topic
+  .spurge               reply to a message and delete everything below it
+  .copy @user|ID         copy new messages from user in this chat/topic
+  .copy all              copy new messages from everyone in this chat/topic
+  .uncopy               stop copying in this chat/topic
 
 Files
   generated files are deleted after sending"""
@@ -272,14 +278,14 @@ def parse_spam_options(raw):
         return None, None
 
     if raw.isdigit():
-        return "", max(1, min(MAX_SPAM_COUNT, int(raw)))
+        return "", max(1, int(raw))
 
     text, _, count_text = raw.rpartition(" ")
 
     if not text.strip() or not count_text.isdigit():
         return None, None
 
-    count = max(1, min(MAX_SPAM_COUNT, int(count_text)))
+    count = max(1, int(count_text))
     return text.strip(), count
 
 
@@ -303,6 +309,132 @@ def topic_id(event):
 
 def spam_key(event):
     return event.chat_id, topic_id(event)
+
+
+def copy_topic_id(event):
+    reply_header = getattr(getattr(event, "message", None), "reply_to", None)
+
+    if not reply_header:
+        return None
+
+    if getattr(reply_header, "reply_to_top_id", None):
+        return getattr(reply_header, "reply_to_top_id", None)
+
+    if getattr(reply_header, "forum_topic", False):
+        return getattr(reply_header, "reply_to_msg_id", None)
+
+    return None
+
+
+def copy_key(event):
+    return event.chat_id, copy_topic_id(event)
+
+
+def copy_reply_to(event):
+    return copy_topic_id(event)
+
+
+def entity_label(entity, fallback="User"):
+    username = getattr(entity, "username", None)
+
+    if username:
+        return f"@{username}"
+
+    return display_name(entity, fallback)
+
+
+async def resolve_copy_target(event, raw):
+    target = raw.strip()
+
+    if not target:
+        reply = await event.get_reply_message()
+
+        if reply and getattr(reply, "sender_id", None):
+            sender = await reply.get_sender()
+            return reply.sender_id, entity_label(sender, str(reply.sender_id))
+
+        raise ValueError("Use: .copy all, .copy @user, .copy ID, or reply to a user with .copy")
+
+    if target.lower() == "all":
+        return None, "all"
+
+    target = target.strip("<>")
+
+    tg_user_match = re.search(r"(?:tg://user\?id=|user\?id=)(\d+)", target)
+
+    if tg_user_match:
+        target = tg_user_match.group(1)
+
+    if target.isdigit():
+        return int(target), target
+
+    entity = await client.get_entity(target)
+    target_id = getattr(entity, "id", None)
+
+    if target_id is None:
+        raise ValueError(f"Could not resolve target: {raw}")
+
+    return target_id, entity_label(entity, str(target_id))
+
+
+async def send_copied_message(event, message, text, media, reply_to):
+    if media:
+        await client.send_file(
+            event.chat_id,
+            media,
+            caption=text or None,
+            reply_to=reply_to,
+            force_document=False,
+        )
+    elif text:
+        await client.send_message(
+            event.chat_id,
+            text,
+            formatting_entities=getattr(message, "entities", None),
+            link_preview=True,
+            reply_to=reply_to,
+        )
+
+
+async def copy_incoming_message(event):
+    active = ACTIVE_COPIES.get(copy_key(event))
+
+    if not active:
+        return
+
+    if active.get("target_id") is not None and getattr(event, "sender_id", None) != active.get("target_id"):
+        return
+
+    message = getattr(event, "message", None)
+
+    if not message:
+        return
+
+    reply_to = copy_reply_to(event)
+    text = event.raw_text or ""
+    media = getattr(message, "media", None)
+
+    if not text and not media:
+        return
+
+    for attempt in range(2):
+        try:
+            await send_copied_message(event, message, text, media, reply_to)
+            return
+        except FloodWaitError as e:
+            wait_seconds = min(int(getattr(e, "seconds", 1) or 1), 60)
+            log(f".copy flood wait in chat {event.chat_id}: waiting {wait_seconds}s")
+            await asyncio.sleep(wait_seconds)
+        except Exception as e:
+            log(f".copy failed in chat {event.chat_id}: {type(e).__name__}: {e}")
+            return
+
+    log(f".copy skipped message in chat {event.chat_id} after flood wait retry")
+
+
+def track_copy_task(task):
+    COPY_TASKS.add(task)
+    task.add_done_callback(COPY_TASKS.discard)
 
 
 def is_tracking_param(name):
@@ -1386,6 +1518,62 @@ def nayan_best_media_url(data):
     return urls[0][1]
 
 
+def collect_video_urls(value, parent_key=""):
+    urls = []
+
+    if isinstance(value, dict):
+        for key, item in value.items():
+            child_key = f"{parent_key}.{key}" if parent_key else str(key)
+            urls.extend(collect_video_urls(item, child_key.lower()))
+    elif isinstance(value, list):
+        for item in value:
+            urls.extend(collect_video_urls(item, parent_key))
+    elif isinstance(value, str):
+        text = value.strip()
+
+        if text.startswith(("http://", "https://")):
+            lower_full = text.lower()
+            lower = lower_full.split("?", 1)[0]
+            key = parent_key.lower()
+            score = 0
+
+            if lower.endswith((".mp4", ".mov", ".webm", ".mkv")):
+                score += 12
+
+            if any(marker in lower_full for marker in ("mime=video", "mime%3dvideo", "type=video", "video/")):
+                score += 12
+
+            if any(word in key for word in ("video", "download", "play", "nowm", "hd", "sd", "watermark")):
+                score += 6
+
+            if "hd" in key:
+                score += 2
+
+            if any(word in key or word in lower for word in ("thumb", "thumbnail", "cover", "avatar", "image", "photo", "picture")):
+                score -= 12
+
+            if any(word in key for word in ("audio", "music", "mp3", "sound")):
+                score -= 8
+
+            if lower.endswith((".jpg", ".jpeg", ".png", ".webp", ".mp3", ".m4a", ".aac", ".ogg", ".wav", ".opus")):
+                score -= 12
+
+            if score > 0:
+                urls.append((score, text))
+
+    return urls
+
+
+def nayan_best_video_url(data):
+    urls = collect_video_urls(data)
+
+    if not urls:
+        return ""
+
+    urls.sort(key=lambda item: item[0], reverse=True)
+    return urls[0][1]
+
+
 def collect_photo_urls(value, parent_key=""):
     urls = []
 
@@ -1705,6 +1893,42 @@ def media_url_has_safe_suffix(url):
     return Path(urlsplit(url).path).suffix.lower() in SAFE_REMOTE_SUFFIXES
 
 
+def validate_downloaded_media(path):
+    path = Path(path)
+
+    if not path.is_file() or path.stat().st_size == 0:
+        raise ValueError("downloaded file is empty")
+
+    header = path.read_bytes()[:64]
+    lower_header = header.lower().lstrip()
+
+    if lower_header.startswith((b"<!doctype", b"<html", b"{", b"[")):
+        raise ValueError("downloaded URL returned an error page instead of media")
+
+    suffix = path.suffix.lower()
+    valid = True
+
+    if suffix in {".jpg", ".jpeg"}:
+        valid = header.startswith(b"\xff\xd8\xff")
+    elif suffix == ".png":
+        valid = header.startswith(b"\x89PNG\r\n\x1a\n")
+    elif suffix == ".webp":
+        valid = header.startswith(b"RIFF") and b"WEBP" in header[:16]
+    elif suffix in {".mp4", ".m4a", ".mov"}:
+        valid = b"ftyp" in header[:16]
+    elif suffix in {".webm", ".mkv"}:
+        valid = header.startswith(b"\x1a\x45\xdf\xa3")
+    elif suffix in {".mp3", ".aac"}:
+        valid = header.startswith(b"ID3") or (len(header) > 1 and header[0] == 0xff and (header[1] & 0xe0) == 0xe0)
+    elif suffix in {".ogg", ".opus"}:
+        valid = header.startswith(b"OggS")
+    elif suffix == ".wav":
+        valid = header.startswith(b"RIFF") and b"WAVE" in header[:16]
+
+    if not valid:
+        raise ValueError(f"downloaded file does not look like valid {suffix or 'media'}")
+
+
 def download_remote_media(url, output_dir, filename="video.mp4"):
     output_dir.mkdir(parents=True, exist_ok=True)
     suffix = Path(urlsplit(url).path).suffix.lower()
@@ -1721,7 +1945,56 @@ def download_remote_media(url, output_dir, filename="video.mp4"):
     with urllib.request.urlopen(request, timeout=120) as response, path.open("wb") as output:
         shutil.copyfileobj(response, output)
 
+    validate_downloaded_media(path)
     return path
+
+
+async def send_downloaded_media(event, path, caption):
+    try:
+        await client.send_file(
+            event.chat_id,
+            str(path),
+            caption=caption,
+            parse_mode="html",
+            force_document=False,
+            reply_to=topic_reply_to(event),
+        )
+    except Exception as media_error:
+        await client.send_file(
+            event.chat_id,
+            str(path),
+            caption=caption,
+            parse_mode="html",
+            force_document=True,
+            reply_to=topic_reply_to(event),
+        )
+
+
+async def send_downloaded_media_album(event, paths, caption):
+    files = [str(path) for path in paths]
+
+    try:
+        await client.send_file(
+            event.chat_id,
+            files,
+            caption=caption,
+            parse_mode="html",
+            force_document=False,
+            reply_to=topic_reply_to(event),
+        )
+        return "album"
+    except Exception as album_error:
+        log(f"album send failed, falling back to individual media: {album_error}")
+
+    for index, path in enumerate(paths):
+        item_caption = caption if index == 0 else None
+
+        try:
+            await send_downloaded_media(event, path, item_caption)
+        except Exception as item_error:
+            raise RuntimeError(f"failed to send photo {index + 1}: {item_error}") from item_error
+
+    return "individual"
 
 
 async def nayan_download_link(event, raw_options="", command_name="video"):
@@ -1754,34 +2027,22 @@ async def nayan_download_link(event, raw_options="", command_name="video"):
 
         caption = build_nayan_caption(data, url, audio_mode)
 
-        if not audio_mode and nayan_photo_slideshow_url(url):
+        media_url = nayan_best_audio_url(data) if audio_mode else nayan_best_video_url(data)
+
+        if not media_url and not audio_mode and nayan_photo_slideshow_url(url):
             photo_urls = nayan_photo_urls(data)
 
             if len(photo_urls) >= 2:
-                await status.edit(tg_code("sending photos..."))
-                files = []
+                await status.edit(tg_code("video not found; sending photos..."))
 
                 for index, photo_url in enumerate(photo_urls, start=1):
-                    if media_url_has_safe_suffix(photo_url):
-                        files.append(photo_url)
-                    else:
-                        photo_path = await asyncio.to_thread(download_remote_media, photo_url, output_dir, f"photo-{index}.jpg")
-                        downloaded_paths.append(photo_path)
-                        files.append(str(photo_path))
+                    photo_path = await asyncio.to_thread(download_remote_media, photo_url, output_dir, f"photo-{index}.jpg")
+                    downloaded_paths.append(photo_path)
 
-                await client.send_file(
-                    event.chat_id,
-                    files,
-                    caption=caption,
-                    parse_mode="html",
-                    force_document=False,
-                    reply_to=topic_reply_to(event),
-                )
+                send_mode = await send_downloaded_media_album(event, downloaded_paths, caption)
                 await status.delete()
-                log(f".{command_name} sent TikTok slideshow in chat {event.chat_id}: {len(files)} photos")
+                log(f".{command_name} sent TikTok slideshow fallback in chat {event.chat_id}: {len(downloaded_paths)} photos ({send_mode})")
                 return
-
-        media_url = nayan_best_audio_url(data) if audio_mode else nayan_best_media_url(data)
 
         if not media_url:
             if audio_mode:
@@ -1805,14 +2066,7 @@ async def nayan_download_link(event, raw_options="", command_name="video"):
         except Exception:
             filename = "audio.mp3" if audio_mode else "video.mp4"
             downloaded_path = await asyncio.to_thread(download_remote_media, media_url, output_dir, filename)
-            await client.send_file(
-                event.chat_id,
-                str(downloaded_path),
-                caption=caption,
-                parse_mode="html",
-                force_document=False,
-                reply_to=topic_reply_to(event),
-            )
+            await send_downloaded_media(event, downloaded_path, caption)
 
         await status.delete()
         log(f".{command_name} sent in chat {event.chat_id}: {media_url}")
@@ -1871,14 +2125,7 @@ async def download_mp3(event, raw_options=""):
             )
         except Exception:
             downloaded_path = await asyncio.to_thread(download_remote_media, audio_url, output_dir, "audio.mp3")
-            await client.send_file(
-                event.chat_id,
-                str(downloaded_path),
-                caption=caption,
-                parse_mode="html",
-                force_document=False,
-                reply_to=topic_reply_to(event),
-            )
+            await send_downloaded_media(event, downloaded_path, caption)
 
         await status.delete()
         log(f".mp3 API sent in chat {event.chat_id}: {audio_url}")
@@ -2012,18 +2259,17 @@ def author_color(name):
 
 
 def quote_bubble_image(author, text, avatar, media_image=None, message_date=None):
-    name_font = load_quote_font(34, bold=True)
-    text_font = load_quote_font(38)
-    time_font = load_quote_font(22)
+    name_font = load_quote_font(36, bold=True)
+    text_font = load_quote_font(40)
 
-    text = fit_quote_text(text, max_chars=850)
-    avatar_size = 104
-    gap = 16
-    max_content_w = 690
-    bubble_pad_x = 30
-    bubble_pad_top = 24
-    bubble_pad_bottom = 28
-    line_spacing = 11
+    text = fit_quote_text(text, max_chars=900)
+    avatar_size = 116
+    pad_x = 30
+    pad_y = 26
+    gap = 24
+    max_content_w = 760
+    min_content_w = 330
+    line_spacing = 12
 
     dummy = Image.new("RGBA", (1, 1))
     measure = ImageDraw.Draw(dummy)
@@ -2031,76 +2277,69 @@ def quote_bubble_image(author, text, avatar, media_image=None, message_date=None
     media = fit_media_image(media_image, max_width=max_content_w, max_height=430) if media_image is not None else None
 
     text_w, text_h = multiline_size(measure, wrapped, text_font, spacing=line_spacing) if wrapped else (0, 0)
-    name_w, name_h = text_size(measure, author, name_font)
+    safe_author = author.strip() or "User"
+    name_w, name_h = text_size(measure, safe_author, name_font)
     media_w, media_h = media.size if media else (0, 0)
-    content_w = max(text_w, media_w, min(name_w, max_content_w), 260)
-    bubble_w = min(max_content_w + bubble_pad_x * 2, max(360, content_w + bubble_pad_x * 2))
-    content_w = bubble_w - bubble_pad_x * 2
+
+    content_w = min(max_content_w, max(min_content_w, text_w, media_w, min(name_w, max_content_w)))
+
+    if name_w > content_w:
+        while safe_author and text_size(measure, safe_author + "...", name_font)[0] > content_w:
+            safe_author = safe_author[:-1]
+        safe_author = safe_author.rstrip() + "..."
+        name_w, name_h = text_size(measure, safe_author, name_font)
 
     if text_w > content_w and wrapped:
         wrapped = wrap_text_to_width(measure, text, text_font, content_w)
         text_w, text_h = multiline_size(measure, wrapped, text_font, spacing=line_spacing)
 
     media_gap = 18 if media and wrapped else 0
-    text_gap = 12 if wrapped else 0
-    footer_h = 22
-    bubble_h = bubble_pad_top + name_h + 12 + media_h + media_gap + text_h + text_gap + footer_h + bubble_pad_bottom
-    width = 18 + avatar_size + gap + bubble_w + 20
-    height = max(avatar_size + 30, bubble_h + 34)
+    text_gap = 0 if wrapped else 0
+    content_h = name_h + 12 + media_h + media_gap + text_h + text_gap
+    card_w = pad_x * 2 + avatar_size + gap + content_w
+    card_h = max(avatar_size + pad_y * 2, pad_y * 2 + content_h)
+    margin = 18
+    width = card_w + margin * 2
+    height = card_h + margin * 2
 
     image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(image)
+    card = Image.new("RGBA", (card_w, card_h), (0, 0, 0, 0))
+    card_draw = ImageDraw.Draw(card)
+    card_box = (0, 0, card_w - 1, card_h - 1)
+    card_fill = (43, 55, 71, 255)
+    radius = 34
 
-    bubble_x = 18 + avatar_size + gap
-    bubble_y = 14
-    bubble_box = (bubble_x, bubble_y, bubble_x + bubble_w, bubble_y + bubble_h)
-    bubble_fill = (30, 31, 36, 248)
-    draw_rounded_shadow(image, bubble_box, radius=34, shadow_offset=(0, 9), blur=18, alpha=115)
-    draw.rounded_rectangle(bubble_box, radius=34, fill=bubble_fill)
-    draw.rounded_rectangle((bubble_x + 1, bubble_y + 1, bubble_x + bubble_w - 1, bubble_y + bubble_h - 1), radius=33, outline=(255, 255, 255, 18), width=1)
-    draw.polygon(
-        [
-            (bubble_x + 10, bubble_y + bubble_h - 48),
-            (bubble_x - 18, bubble_y + bubble_h - 25),
-            (bubble_x + 18, bubble_y + bubble_h - 22),
-        ],
-        fill=bubble_fill,
+    shadow = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    shadow_draw = ImageDraw.Draw(shadow)
+    shadow_draw.rounded_rectangle(
+        (margin, margin + 7, margin + card_w, margin + card_h + 7),
+        radius=radius,
+        fill=(0, 0, 0, 105),
     )
+    shadow = shadow.filter(ImageFilter.GaussianBlur(14))
+    image.alpha_composite(shadow)
 
-    avatar_x = 14
-    avatar_y = bubble_y + bubble_h - avatar_size - 8
-    draw.ellipse((avatar_x - 3, avatar_y - 3, avatar_x + avatar_size + 3, avatar_y + avatar_size + 3), fill=(255, 255, 255, 32))
+    card_draw.rounded_rectangle(card_box, radius=radius, fill=card_fill)
+    card_draw.rounded_rectangle(card_box, radius=radius, outline=(255, 255, 255, 18), width=1)
+
     avatar = avatar.resize((avatar_size, avatar_size), Image.Resampling.LANCZOS)
-    image.alpha_composite(avatar, (avatar_x, avatar_y))
+    avatar_x = pad_x
+    avatar_y = (card_h - avatar_size) // 2
+    card.alpha_composite(avatar, (avatar_x, avatar_y))
 
-    x = bubble_x + bubble_pad_x
-    y = bubble_y + bubble_pad_top
-    safe_author = author.strip() or "User"
-    if text_size(measure, safe_author, name_font)[0] > content_w:
-        while safe_author and text_size(measure, safe_author + "...", name_font)[0] > content_w:
-            safe_author = safe_author[:-1]
-        safe_author = safe_author.rstrip() + "..."
-
-    draw.text((x, y), safe_author, font=name_font, fill=author_color(author))
+    x = pad_x + avatar_size + gap
+    y = pad_y
+    card_draw.text((x, y), safe_author, font=name_font, fill=author_color(author))
     y += name_h + 12
 
     if media:
-        image.alpha_composite(media, (x, y))
+        card.alpha_composite(media, (x, y))
         y += media_h + media_gap
 
     if wrapped:
-        draw.multiline_text((x, y), wrapped, font=text_font, fill=(246, 247, 249, 255), spacing=line_spacing)
-        y += text_h + text_gap
+        card_draw.multiline_text((x, y), wrapped, font=text_font, fill=(245, 247, 250, 255), spacing=line_spacing)
 
-    timestamp = brasilia_datetime(message_date).strftime("%H:%M")
-    time_w, time_h = text_size(measure, timestamp, time_font)
-    draw.text(
-        (bubble_x + bubble_w - time_w - 24, bubble_y + bubble_h - time_h - 16),
-        timestamp,
-        font=time_font,
-        fill=(152, 156, 166, 230),
-    )
-
+    image.alpha_composite(card, (margin, margin))
     return image
 
 def create_quote_image(author, text, avatar, media_image=None, message_date=None):
@@ -2296,17 +2535,26 @@ async def quote_message(event, raw_options=""):
 
     try:
         if send_png:
-            await event.reply(file=str(png_path))
+            await event.client.send_file(event.chat_id, str(png_path), force_document=False)
+            try:
+                await event.delete()
+            except Exception:
+                pass
             log(f".q PNG sent in chat {event.chat_id}")
             return
 
         sticker_path = create_quote_sticker(png_path)
         generated_paths.append(sticker_path)
-        await event.reply(
+        await event.client.send_file(
+            event.chat_id,
             file=str(sticker_path),
             force_document=False,
             attributes=[DocumentAttributeSticker(alt="💬", stickerset=InputStickerSetEmpty())],
         )
+        try:
+            await event.delete()
+        except Exception:
+            pass
         log(f".q sticker sent in chat {event.chat_id}")
     finally:
         cleanup_files(*generated_paths)
@@ -2996,6 +3244,76 @@ async def clear_own_messages(event):
         await client.send_message("me", tg_code(f".cl failed in chat {chat_id}:\n{e}"))
 
 
+async def delete_message_ids(chat_id, message_ids):
+    deleted = 0
+
+    for index in range(0, len(message_ids), 100):
+        chunk = message_ids[index:index + 100]
+
+        if not chunk:
+            continue
+
+        await client.delete_messages(chat_id, chunk, revoke=True)
+        deleted += len(chunk)
+
+    return deleted
+
+
+async def spurge_messages(event):
+    reply = await event.get_reply_message()
+
+    if not reply:
+        await event.reply(tg_code("Use: reply to a message with .spurge"))
+        return
+
+    chat_id = event.chat_id
+    selected_topic = copy_topic_id(event)
+    start_id = min(reply.id, event.id)
+    end_id = max(reply.id, event.id)
+    message_ids = []
+
+    try:
+        if selected_topic:
+            try:
+                async for message in client.iter_messages(
+                    chat_id,
+                    min_id=start_id - 1,
+                    max_id=end_id + 1,
+                    reply_to=selected_topic,
+                ):
+                    message_ids.append(message.id)
+            except Exception:
+                message_ids = []
+                async for message in client.iter_messages(chat_id, min_id=start_id - 1, max_id=end_id + 1):
+                    if message_matches_topic(message, selected_topic):
+                        message_ids.append(message.id)
+
+            if event.id not in message_ids:
+                message_ids.append(event.id)
+        else:
+            message_ids = list(range(start_id, end_id + 1))
+
+        message_ids = sorted(set(message_ids))
+        deleted = await delete_message_ids(chat_id, message_ids)
+        scope = f"topic {selected_topic}" if selected_topic else "chat"
+        log(f".spurge deleted {deleted} messages from {scope} {chat_id}")
+    except Exception as e:
+        try:
+            await event.reply(tg_code(f".spurge failed:\n{e}"))
+        except Exception:
+            await client.send_message("me", tg_code(f".spurge failed in chat {chat_id}:\n{e}"))
+        log(f".spurge failed in chat {chat_id}: {type(e).__name__}: {e}")
+
+
+@client.on(events.NewMessage(incoming=True))
+async def copy_handler(event):
+    try:
+        task = asyncio.create_task(copy_incoming_message(event))
+        track_copy_task(task)
+    except Exception as e:
+        log(f".copy handler failed in chat {getattr(event, 'chat_id', None)}: {type(e).__name__}: {e}")
+
+
 async def handle_telegram_terminal(event):
     name, _ = parse_command(event.raw_text, TERMINAL_PREFIX)
 
@@ -3069,7 +3387,8 @@ async def handler(event):
                     await client.send_message(chat_id, text, reply_to=reply_to)
                 else:
                     await client.send_message(chat_id, "", file=media, reply_to=reply_to)
-                await asyncio.sleep(SPAM_DELAY_SECONDS)
+                if SPAM_DELAY_SECONDS > 0:
+                    await asyncio.sleep(SPAM_DELAY_SECONDS)
         finally:
             if ACTIVE_SPAMS.get(active_key) is stop_event:
                 ACTIVE_SPAMS.pop(active_key, None)
@@ -3089,6 +3408,27 @@ async def handler(event):
         await cancel_chat_export(event, rest)
     elif name == "cl":
         await clear_own_messages(event)
+    elif name == "spurge":
+        await spurge_messages(event)
+    elif name == "copy":
+        try:
+            target_id, label = await resolve_copy_target(event, rest)
+        except Exception as e:
+            await event.reply(tg_code(str(e)))
+            return
+
+        ACTIVE_COPIES[copy_key(event)] = {"target_id": target_id, "label": label}
+        if target_id is None:
+            await event.reply(tg_code("Copy enabled for everyone in this chat/topic."))
+        else:
+            await event.reply(tg_code(f"Copy enabled for {label} ({target_id}) in this chat/topic."))
+    elif name == "uncopy":
+        active = ACTIVE_COPIES.pop(copy_key(event), None)
+
+        if active:
+            await event.reply(tg_code(f"Copy disabled for {active.get('label', active.get('target_id'))}."))
+        else:
+            await event.reply(tg_code("No copy running in this chat/topic."))
     elif name == "unspam":
         active_key = spam_key(event)
         stop_events = []

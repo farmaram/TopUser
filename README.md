@@ -100,7 +100,7 @@ Quotes
 Spam
 
 ```text
-.spam text N          send text N times, max 1000
+.spam text N          send text N times
 .spam N               reply to media and resend it N times
 .unspam               stop spam in this chat/topic
 ```
@@ -144,6 +144,10 @@ Chat
 .exportchat ID/@user  export another chat as HTML
 .cancelexport         stop export and send partial HTML
 .cl                   delete your messages in this chat/topic
+.spurge               reply to a message and delete everything below it
+.copy @user|ID         copy new messages from user in this chat/topic
+.copy all              copy new messages from everyone in this chat/topic
+.uncopy               stop copying in this chat/topic
 ```
 
 `.exportchat` creates a Telegram-style dark HTML archive with chat bubbles, a top search bar, the chat/group name, low-quality user avatars, messages grouped by day, and user filters. Use `.exportchat --media` to receive a ZIP with `index.html` plus downloaded media/docs. It works in normal groups and topic groups. `.cancelexport` stops the running export and immediately sends the partial HTML collected so far.
